@@ -1,0 +1,16 @@
+server.crt
+server.key
+*.crt
+*.key
+*.pem
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
