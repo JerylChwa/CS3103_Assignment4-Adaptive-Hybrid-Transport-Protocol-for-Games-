@@ -120,6 +120,10 @@ class GameClientProtocol:
         payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
         seq = self.next_seq(UNRELIABLE_CHANNEL)
         datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
+
+        self.metrics["reliable"]["tx"] += 1
+        self.metrics["unreliable"]["bytes_tx"] += len(datagram)
+
         self.quic.send_datagram_frame(datagram)
         self.endpoint.transmit()
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
@@ -205,6 +209,7 @@ class ClientEvents(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             # Reliable data from server (echo ACK from server)
             rx_ts = time.time()
+            data_str = None
             try:
                 data_str = event.data.decode()
                 if not data_str.startswith("ack:"):
@@ -212,13 +217,23 @@ class ClientEvents(QuicConnectionProtocol):
                 
                 # Parse the echoed reliable packet to get the original timestamp
                 original_packet = json.loads(data_str[4:])
-                
+                seq = original_packet.get("seq")
+
                 # Calculate RTT based on sender's original timestamp
-                sent_ts = original_packet.get("ts", rx_ts)
-                rtt = (rx_ts - sent_ts) * 1000  # RTT in milliseconds
-                
-                # (Requirement g) RTT Logging
-                print(f"[client] [Reliable] ACK RX: AppSeq={original_packet.get('seq')}, RTT={rtt:.2f}ms")
+                sent_ts = float(original_packet.get("ts", rx_ts))
+
+                client = getattr(self, "metrics_client", None)
+                if client is not None and seq is not None:
+                    send_ts = client._inflight.pop(seq, sent_ts)
+                    rtt_ms = (rx_ts - send_ts) * 1000
+                    m = client.metrics["reliable"]
+                    m["ack"] += 1
+                    m["rtt"].add(rtt_ms)
+                    m["jitter"].add(rtt_ms)
+                else:
+                    rtt_ms = (rx_ts - sent_ts) * 1000
+
+                    print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
             except Exception:
                 # Handle initial client_hello ACK or malformed data
                 if "client_hello" not in data_str:
@@ -239,6 +254,7 @@ async def main(host: str = "127.0.0.1", port: int = 4433):
 
     async with connect(host, port, configuration=cfg, create_protocol=ClientEvents) as endpoint:
         client = GameClientProtocol(endpoint)
+        endpoint.metrics_client = client
         await client.run()
 
 if __name__ == "__main__":
