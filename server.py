@@ -2,6 +2,9 @@ import asyncio
 import json
 import time
 from typing import Dict, Any, List, Tuple
+from metrics import RollingStats, Jitter
+
+METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
 
 try:
     import uvloop
@@ -34,6 +37,22 @@ class GameServer(QuicConnectionProtocol):
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
         self.next_expected_seq = 0
         self.flush_task: Optional[asyncio.Task] = None
+
+        #set up metric storage
+        self.metrics = {
+            "reliable": {
+                "owl": RollingStats(),
+                "jitter": Jitter(),
+                "rx": 0, "stale": 0, "ooo": 0, "dup": 0, "bytes": 0
+            },
+            "unreliable": {
+                "owl": RollingStats(),
+                "jitter": Jitter(),
+                "rx": 0, "bytes": 0
+            }
+        }
+        self._last_metrics_print = time.time()
+
 
     def connection_made(self, transport):
         super().connection_made(transport)
