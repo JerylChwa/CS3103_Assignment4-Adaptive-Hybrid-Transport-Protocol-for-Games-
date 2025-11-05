@@ -29,16 +29,6 @@ class Inflight:
     ts_last_ms: int #time of last send
     retries: int = 0
 
-#global runtime state
-inflight: dict[int, Inflight] = {} #seq num: packet data
-srtts_ms: float | None = None #smooth rtt - estimate
-rttvar_ms: float | None = None #variation in RTT
-RTO_min_ms = 100 #lowerbound RTO
-RTO_max_ms = 3000 #upperbound RTO
-MAX_RETRIES = 5
-next_seq = 0 #increments 1 each send
-
-
 ALPN = "game/1"
 RELIABLE_CHANNEL = 0  # Used for Stream Data (Critical State)
 UNRELIABLE_CHANNEL = 1  # Used for Datagrams (Movement)
@@ -70,7 +60,15 @@ class GameClientProtocol:
 
         self._start_time = time.time()
         self._metrics_task: Optional[asyncio.Task] = None
+        self._retransmit_task: Optional[asyncio.Task] = None
+
         self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
+        self.srtts_ms: float | None = None  # smooth rtt - estimate
+        self.rttvar_ms: float | None = None  # variation in RTT
+        self.RTO_min_ms = 100  # lowerbound RTO
+        self.RTO_max_ms = 3000  # upperbound RTO
+        self.MAX_RETRIES = 5
+        self.next_seq = 0  # increments 1 each send
 
         #storage for server rx counters
         self._server_unrel_rx = 0
@@ -84,6 +82,12 @@ class GameClientProtocol:
                 "tx": 0, "bytes_tx": 0,
             }
         }
+
+    # returns RTO between min and max defined above, scaled by latency and variability
+    def RTO_ms(self):
+        if self.srtts_ms is None:
+            return 1000
+        return max(self.RTO_min_ms, min(self.RTO_max_ms, int(self.srtts_ms + 4 * self.rttvar_ms)))
 
     def _print_metrics_summary(self):
         now = time.time()
@@ -217,6 +221,9 @@ class GameClientProtocol:
                 
         except asyncio.CancelledError:
             pass
+
+    async def retransmit_scheduler(self):
+        pass
 
 class ClientEvents(QuicConnectionProtocol):
     """
