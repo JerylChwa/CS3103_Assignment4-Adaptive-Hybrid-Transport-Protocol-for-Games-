@@ -125,6 +125,13 @@ class GameClientProtocol:
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
 
     
+    async def _periodic_metrics_print(self):
+        try:
+            while True:
+                await asyncio.sleep(METRIC_SUMMARY_EVERY_S)
+                self._print_metrics_summary()
+        except asyncio.CancelledError:
+            pass
 
     async def run(self):
         # Initial reliable hello for connection setup
@@ -134,7 +141,7 @@ class GameClientProtocol:
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
             self.endpoint.transmit()
 
-        
+        self._metrics_task = asyncio.create_task(self._periodic_metrics_print())
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
         mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30)) 
@@ -142,6 +149,8 @@ class GameClientProtocol:
         await asyncio.sleep(10)  
         recv_task.cancel()
         mixed_task.cancel()
+        if self._metrics_task:
+            self._metrics_task.cancel()
         
         self.quic.close()
         self.endpoint.transmit()
