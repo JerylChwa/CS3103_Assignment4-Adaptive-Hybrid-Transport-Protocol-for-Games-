@@ -106,6 +106,19 @@ class GameServer(QuicConnectionProtocol):
             while True:
                 await asyncio.sleep(METRIC_SUMMARY_EVERY_S)
                 self._print_metrics_summary()
+
+                try:
+                    stats = {
+                        "type": "server_metrics",
+                        "unrel_rx": self.metrics["unreliable"]["rx"],
+                        "rel_rx": self.metrics["reliable"]["rx"],
+                    }
+                    sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                    self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
+                    self.transmit()
+                except Exception as e:
+                    print(f"[server] Warning: failed to send metrics heartbeat: {e}")
+
         except asyncio.CancelledError:
             pass
 
