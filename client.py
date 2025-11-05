@@ -5,9 +5,6 @@ import time
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
 
-
-METRIC_SUMMARY_EVERY_S = 3.0
-
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -58,7 +55,6 @@ class GameClientProtocol:
 
         #storage for server rx counters
         self._server_unrel_rx = 0
-        self._server_rel_rx = 0
 
         self.metrics = {
             "reliable": {
@@ -91,10 +87,12 @@ class GameClientProtocol:
 
         u = self.metrics["unreliable"]
         u_tput = u["bytes_tx"] / 1024.0 / dur
-        u_pdr = (100.0 * self._server_unrel_rx / max(1, u["tx"]))  # server-RX / client-TX
+        u_pdr = 100.0 * self._server_unrel_rx / max(1, u["tx"])
+
         print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']} PDR={u_pdr:.1f}%")
         print(f"    Throughput ≈ {u_tput:.2f} kB/s")
         print("[client] --------------------------\n")
+
 
 
     def next_seq(self, channel: int) -> int:
@@ -141,14 +139,6 @@ class GameClientProtocol:
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
 
     
-    async def _periodic_metrics_print(self):
-        try:
-            while True:
-                await asyncio.sleep(METRIC_SUMMARY_EVERY_S)
-                self._print_metrics_summary()
-        except asyncio.CancelledError:
-            pass
-
     async def run(self):
         # Initial reliable hello for connection setup
         if self.ctrl_stream_id is None:
@@ -157,7 +147,6 @@ class GameClientProtocol:
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
             self.endpoint.transmit()
 
-        self._metrics_task = asyncio.create_task(self._periodic_metrics_print())
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
         mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30)) 
@@ -251,6 +240,7 @@ class ClientEvents(QuicConnectionProtocol):
                     if client:
                         client._server_unrel_rx = int(pkt.get("unrel_rx", 0))
                         client._server_rel_rx = int(pkt.get("rel_rx", 0))
+                        client._print_metrics_summary()
                     return
 
             except Exception:
