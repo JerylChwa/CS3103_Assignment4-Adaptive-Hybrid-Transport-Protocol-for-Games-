@@ -3,6 +3,8 @@ import json
 import random
 import time
 from typing import Optional, Dict
+from metrics import RollingStats, Jitter
+from server import METRIC_SUMMARY_EVERY_S
 
 try:
     import uvloop
@@ -47,6 +49,20 @@ class GameClientProtocol:
         self.quic: QuicConnection = endpoint._quic
         self.seq_by_channel = {RELIABLE_CHANNEL: -1, UNRELIABLE_CHANNEL: -1}
         self.ctrl_stream_id: Optional[int] = None
+
+        self._start_time = time.time()
+        self._metrics_task = Optional[asyncio.Task()] = None
+        self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
+
+        self.metrics = {
+            "reliable": {
+                "tx": 0, "ack": 0, "bytes_tx": 0,
+                "rtt": RollingStats(), "jitter": Jitter()
+            },
+            "unreliable": {
+                "tx": 0, "bytes_tx": 0,
+            }
+        }
 
     def next_seq(self, channel: int) -> int:
         s = self.seq_by_channel.get(channel, -1) + 1
