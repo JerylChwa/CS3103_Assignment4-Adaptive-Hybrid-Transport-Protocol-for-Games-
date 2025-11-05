@@ -3,6 +3,7 @@ import json
 import random
 import time
 from typing import Optional, Dict
+from metrics import RollingStats, Jitter
 
 try:
     import uvloop
@@ -48,6 +49,52 @@ class GameClientProtocol:
         self.seq_by_channel = {RELIABLE_CHANNEL: -1, UNRELIABLE_CHANNEL: -1}
         self.ctrl_stream_id: Optional[int] = None
 
+        self._start_time = time.time()
+        self._metrics_task: Optional[asyncio.Task] = None
+        self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
+
+        #storage for server rx counters
+        self._server_unrel_rx = 0
+
+        self.metrics = {
+            "reliable": {
+                "tx": 0, "ack": 0, "bytes_tx": 0,
+                "rtt": RollingStats(), "jitter": Jitter()
+            },
+            "unreliable": {
+                "tx": 0, "bytes_tx": 0,
+            }
+        }
+
+    def _print_metrics_summary(self):
+        now = time.time()
+        dur = max(1e-6, now - self._start_time)
+
+        r = self.metrics["reliable"]
+        r_p = r["rtt"].percentiles()
+        r_tput = r["bytes_tx"] / 1024.0 / dur
+        pdr = 100.0 * r["ack"] / max(1, r["tx"])
+        print("\n[client] 📊 ---- METRIC SUMMARY ----")
+        print(f"[metrics][RELIABLE] TX={r['tx']} ACK={r['ack']} PDR={pdr:.1f}% BytesTX={r['bytes_tx']}")
+        if len(r["rtt"].samples) > 0:
+            print(f"    RTT(ms): avg={r['rtt'].avg():.2f} "
+                  f"p50={r_p.get(50, float('nan')):.2f} "
+                  f"p95={r_p.get(95, float('nan')):.2f} "
+                  f"jitter(RFC3550)={r['jitter'].value():.2f}")
+        else:
+            print("    RTT(ms): No samples yet")
+        print(f"    Throughput ≈ {r_tput:.2f} kB/s")
+
+        u = self.metrics["unreliable"]
+        u_tput = u["bytes_tx"] / 1024.0 / dur
+        u_pdr = 100.0 * self._server_unrel_rx / max(1, u["tx"])
+
+        print(f"[metrics][UNRELIABLE] TX={u['tx']} BytesTX={u['bytes_tx']} PDR={u_pdr:.1f}%")
+        print(f"    Throughput ≈ {u_tput:.2f} kB/s")
+        print("[client] --------------------------\n")
+
+
+
     def next_seq(self, channel: int) -> int:
         s = self.seq_by_channel.get(channel, -1) + 1
         self.seq_by_channel[channel] = s
@@ -65,6 +112,11 @@ class GameClientProtocol:
             seq=seq,
             payload={"player_id": 1, "score": random.randint(0, 100)}
         )
+
+        self.metrics["reliable"]["tx"] += 1
+        self.metrics["reliable"]["bytes_tx"] += len(critical_state)
+        self._inflight[seq] = time.time()
+
         self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
         self.endpoint.transmit()
         print(f"[client] [Reliable] SENT: Seq={seq}, Size={len(critical_state)}, TS={time.time():.4f}")
@@ -78,12 +130,15 @@ class GameClientProtocol:
         payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
         seq = self.next_seq(UNRELIABLE_CHANNEL)
         datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
+
+        self.metrics["unreliable"]["tx"] += 1
+        self.metrics["unreliable"]["bytes_tx"] += len(datagram)
+
         self.quic.send_datagram_frame(datagram)
         self.endpoint.transmit()
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
 
     
-
     async def run(self):
         # Initial reliable hello for connection setup
         if self.ctrl_stream_id is None:
@@ -92,7 +147,6 @@ class GameClientProtocol:
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
             self.endpoint.transmit()
 
-        
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
         mixed_task = asyncio.create_task(self._mixed_loop(reliable_hz=5, unreliable_hz=30)) 
@@ -100,6 +154,8 @@ class GameClientProtocol:
         await asyncio.sleep(10)  
         recv_task.cancel()
         mixed_task.cancel()
+        if self._metrics_task:
+            self._metrics_task.cancel()
         
         self.quic.close()
         self.endpoint.transmit()
@@ -154,28 +210,44 @@ class ClientEvents(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             # Reliable data from server (echo ACK from server)
             rx_ts = time.time()
+            data_str = None
             try:
                 data_str = event.data.decode()
-                if not data_str.startswith("ack:"):
+                if data_str.startswith("ack:"):
+                    # Parse the echoed reliable packet to get the original timestamp
+                    original_packet = json.loads(data_str[4:])
+                    seq = original_packet.get("seq")
+
+                    # Calculate RTT based on sender's original timestamp
+                    sent_ts = float(original_packet.get("ts", rx_ts))
+
+                    client = getattr(self, "metrics_client", None)
+                    if client is not None and seq is not None:
+                        send_ts = client._inflight.pop(seq, sent_ts)
+                        rtt_ms = (rx_ts - send_ts) * 1000
+                        m = client.metrics["reliable"]
+                        m["ack"] += 1
+                        m["rtt"].add(rtt_ms)
+                        m["jitter"].add(rtt_ms)
+                    else:
+                        rtt_ms = (rx_ts - sent_ts) * 1000
+                    print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
                     return
-                
-                # Parse the echoed reliable packet to get the original timestamp
-                original_packet = json.loads(data_str[4:])
-                
-                # Calculate RTT based on sender's original timestamp
-                sent_ts = original_packet.get("ts", rx_ts)
-                rtt = (rx_ts - sent_ts) * 1000  # RTT in milliseconds
-                
-                # (Requirement g) RTT Logging
-                print(f"[client] [Reliable] ACK RX: AppSeq={original_packet.get('seq')}, RTT={rtt:.2f}ms")
+
+                pkt = json.loads(data_str)
+                if pkt.get("type") == "server_metrics":
+                    client = getattr(self, "metrics_client", None)
+                    if client:
+                        client._server_unrel_rx = int(pkt.get("unrel_rx", 0))
+                        client._server_rel_rx = int(pkt.get("rel_rx", 0))
+                        client._print_metrics_summary()
+                    return
+
             except Exception:
                 # Handle initial client_hello ACK or malformed data
-                if "client_hello" not in data_str:
+                if data_str and "client_hello" not in data_str:
                     print(f"[client] [Reliable] Data RX: {event.data!r}")
 
-        elif isinstance(event, DatagramFrameReceived):
-            # Unreliable from server
-            pass
 
 async def main(host: str = "127.0.0.1", port: int = 4433):
     cfg = QuicConfiguration(
@@ -188,6 +260,7 @@ async def main(host: str = "127.0.0.1", port: int = 4433):
 
     async with connect(host, port, configuration=cfg, create_protocol=ClientEvents) as endpoint:
         client = GameClientProtocol(endpoint)
+        endpoint.metrics_client = client
         await client.run()
 
 if __name__ == "__main__":

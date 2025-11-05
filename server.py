@@ -1,7 +1,10 @@
 import asyncio
 import json
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+from metrics import RollingStats, Jitter
+
+METRIC_SUMMARY_EVERY_S = 5.0 #how many seconds between esach metric summary
 
 try:
     import uvloop
@@ -34,16 +37,103 @@ class GameServer(QuicConnectionProtocol):
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
         self.next_expected_seq = 0
         self.flush_task: Optional[asyncio.Task] = None
+        self._last_counters = {"rel_rx": 0, "unrel_rx": 0, "bytes": 0}
+
+        self._start_time = time.time()
+        self.metrics_task: Optional[asyncio.Task] = None
+        #set up metric storage
+        self.metrics = {
+            "reliable": {
+                "owl": RollingStats(),
+                "jitter": Jitter(),
+                "rx": 0, "stale": 0, "ooo": 0, "dup": 0, "bytes": 0
+            },
+            "unreliable": {
+                "owl": RollingStats(),
+                "jitter": Jitter(),
+                "rx": 0, "bytes": 0
+            }
+        }
+
+    def _had_activity_since_last(self):
+        r = self.metrics["reliable"];
+        u = self.metrics["unreliable"]
+        cur = {
+            "rel_rx": r.get("rx", 0),
+            "unrel_rx": u.get("rx", 0),
+            "bytes": r.get("bytes", 0) + u.get("bytes", 0),
+        }
+        changed = any(cur[k] != self._last_counters[k] for k in cur)
+        self._last_counters = cur
+        return changed
+
+    def _print_metrics_summary(self):
+        now = time.time()
+        print("\n[server] 📊 ---- METRIC SUMMARY ----")
+        for pkt_type in ("reliable", "unreliable"):
+            m = self.metrics[pkt_type]
+            dur = max(1e-6, now - self._start_time)
+            tput = m.get("bytes", 0) / 1024.0 / dur #kB/s
+
+            header = f"[metrics][{pkt_type.upper()}] RX={m.get('rx', 0)} Bytes={m.get('bytes', 0)}"
+            if pkt_type == "reliable":
+                header += (
+                    f" Stale={m.get('stale', 0)}"
+                    f" OOO={m.get('ooo', 0)}"
+                    f" Dup={m.get('dup', 0)}"
+                )
+            print(header)
+
+            owl_stats = m.get("owl")
+            if owl_stats and len(owl_stats.samples) > 0:
+                p = owl_stats.percentiles()
+                avg_owl = owl_stats.avg()
+                jitter_val = m["jitter"].value()
+                print(
+                    f"    OWL(ms): avg={avg_owl:.2f}, "
+                    f"p50={p.get(50, float('nan')):.2f}, "
+                    f"p95={p.get(95, float('nan')):.2f}, "
+                    f"jitter(RFC3550)={jitter_val:.2f}"
+                )
+            else:
+                print("    OWL(ms): no samples")
+
+            print(f"    Throughput ≈ {tput:.2f} kB/s")
+        print("[server] --------------------------\n")
 
     def connection_made(self, transport):
         super().connection_made(transport)
         # Part e background task to flush the reliable packet buffer RDT
         self.flush_task = asyncio.create_task(self._flush_reliable_data())
+        self.metrics_task = asyncio.create_task(self._periodic_metrics_print())
 
     def connection_lost(self, exc):
         super().connection_lost(exc)
         if self.flush_task:
             self.flush_task.cancel()
+        if self.metrics_task:
+            self.metrics_task.cancel()
+
+    async def _periodic_metrics_print(self):
+        try:
+            while True:
+                await asyncio.sleep(METRIC_SUMMARY_EVERY_S)
+                if self._had_activity_since_last():
+                    self._print_metrics_summary()
+                    #send heartbeat only when there was recent activity
+                    try:
+                        stats = {
+                            "type": "server_metrics",
+                            "unrel_rx": self.metrics["unreliable"]["rx"],
+                            "rel_rx": self.metrics["reliable"]["rx"],
+                        }
+                        sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                        self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
+                        self.transmit()
+                    except Exception as e:
+                        print(f"[server] Warning: failed to send metrics heartbeat: {e}")
+        except asyncio.CancelledError:
+            pass
 
     async def _flush_reliable_data(self):
         
@@ -61,7 +151,7 @@ class GameServer(QuicConnectionProtocol):
                          time_waiting = (now - rx_ts) * 1000
 
                          if time_waiting > RELIABLE_TIMEOUT_MS:
-                            
+                            self.metrics["reliable"]["stale"] += 1
                             print(f"[server] ⚠️ RELIABLE SKIP: Seq={self.next_expected_seq} skipped. Next Seq={next_available_seq} waited for {time_waiting:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
                             self.next_expected_seq += 1
                             skipped_this_cycle = True
@@ -80,7 +170,13 @@ class GameServer(QuicConnectionProtocol):
                         
                         # Logging
                         print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
-                        
+
+                        m_r = self.metrics["reliable"]
+                        m_r["rx"] += 1
+                        m_r["bytes"] += len(data_bytes)
+                        m_r["owl"].add(owl_ms)
+                        m_r["jitter"].add(owl_ms)
+
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
                         self.transmit()
@@ -108,6 +204,7 @@ class GameServer(QuicConnectionProtocol):
         elif isinstance(event, StreamDataReceived):
             # buffer here
             rx_ts = time.time()
+            r_str = "reliable"
             
             try:
                 data_str = event.data.decode()
@@ -117,19 +214,25 @@ class GameServer(QuicConnectionProtocol):
 
                 packet = json.loads(data_str)
                 app_seq = packet.get("seq")
+                pkt_ts = packet.get("ts")
                 
-                if app_seq is not None:
-                    if app_seq < self.next_expected_seq:
-                        print(f"[server] 🔄 [Reliable] RX: Seq={app_seq} (Stale), current expected={self.next_expected_seq}")
-                        return
-                    
-                    # part e buffer 
-                    self.reliable_buffer[app_seq] = (rx_ts, event.data)
-                    
-                    if app_seq > self.next_expected_seq:
-                        # part g: Packet arrived out-of-order 
-                        print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
-                    
+                if app_seq is None or pkt_ts is None:
+                    print(f"[server] [Reliable]  RC: missing seq/ts: {packet}.")
+                    return
+
+                if app_seq < self.next_expected_seq:
+                    self.metrics[r_str]["dup"] = self.metrics[r_str].get("dup", 0) + 1
+                    print(f"[server] 🔄 [Reliable] RX: Seq={app_seq}, current expected={self.next_expected_seq}")
+                    return
+
+                # part e buffer
+                self.reliable_buffer[app_seq] = (rx_ts, event.data)
+
+                if app_seq > self.next_expected_seq:
+                    # part g: Packet arrived out-of-order
+                    self.metrics[r_str]["ooo"] += 1
+                    print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
+
                 else:
                     print(f"[server] [Reliable] RX: Unsequenced data: {event.data!r}")
             
@@ -152,6 +255,12 @@ class GameServer(QuicConnectionProtocol):
                 sent_ts = float(sent_ts_str)
                 
                 owl_ms = (rx_ts - sent_ts) * 1000
+
+                m_u = self.metrics["unreliable"]
+                m_u["rx"] += 1
+                m_u["bytes"] += len(event.data)
+                m_u["owl"].add(owl_ms)
+                m_u["jitter"].add(owl_ms)
                 
                 # Logging
                 print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, OWL={owl_ms:.2f}ms, Data={payload_str.split(',ts:')[0]}")
