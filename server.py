@@ -86,7 +86,7 @@ class GameServer(QuicConnectionProtocol):
                 print("OWL(ms): no samples")
 
             print(f"Throughput ≈ {tput:.2f} kB/s")
-            print("[server] --------------------------\n")
+        print("[server] --------------------------\n")
 
     def connection_made(self, transport):
         super().connection_made(transport)

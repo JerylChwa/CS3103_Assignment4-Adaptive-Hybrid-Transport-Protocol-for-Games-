@@ -4,7 +4,9 @@ import random
 import time
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
-from server import METRIC_SUMMARY_EVERY_S
+
+
+METRIC_SUMMARY_EVERY_S = 3.0
 
 try:
     import uvloop
@@ -51,7 +53,7 @@ class GameClientProtocol:
         self.ctrl_stream_id: Optional[int] = None
 
         self._start_time = time.time()
-        self._metrics_task = Optional[asyncio.Task] = None
+        self._metrics_task: Optional[asyncio.Task] = None
         self._inflight: Dict[int, float] = {} #seq: send_ts to calc RTT
 
         self.metrics = {
@@ -126,7 +128,7 @@ class GameClientProtocol:
         seq = self.next_seq(UNRELIABLE_CHANNEL)
         datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
 
-        self.metrics["reliable"]["tx"] += 1
+        self.metrics["unreliable"]["tx"] += 1
         self.metrics["unreliable"]["bytes_tx"] += len(datagram)
 
         self.quic.send_datagram_frame(datagram)
@@ -237,8 +239,7 @@ class ClientEvents(QuicConnectionProtocol):
                     m["jitter"].add(rtt_ms)
                 else:
                     rtt_ms = (rx_ts - sent_ts) * 1000
-
-                    print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
+                print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
             except Exception:
                 # Handle initial client_hello ACK or malformed data
                 if "client_hello" not in data_str:
