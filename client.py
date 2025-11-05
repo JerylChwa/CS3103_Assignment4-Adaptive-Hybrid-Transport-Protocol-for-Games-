@@ -2,7 +2,6 @@ import asyncio
 import json
 import random
 import time
-from sys import set_int_max_str_digits
 from typing import Optional, Dict
 from metrics import RollingStats, Jitter
 from dataclasses import dataclass, field
@@ -69,8 +68,8 @@ class GameClientProtocol:
         self.rttvar_ms = 0.0  # variation in RTT
         self.RTO_min_ms = 100  # lowerbound RTO
         self.RTO_max_ms = 3000  # upperbound RTO
-        self.MAX_RETRIES = 5
         self.next_seq = 0  # increments 1 each send
+        self.MAX_RETRIES = 5
 
         #storage for server rx counters
         self._server_unrel_rx = 0
@@ -88,7 +87,7 @@ class GameClientProtocol:
     #helpers for rtt and rto calculations
     # returns RTO between min and max defined above, scaled by latency and variability
     def RTO_ms(self):
-        if self.srtts_ms is None:
+        if self.srtt_ms is None:
             return 1000
         rto = self.srtt_ms + 4 * self.rttvar_ms
         return max(self.RTO_min_ms, min(self.RTO_max_ms, int(rto)))
@@ -136,7 +135,7 @@ class GameClientProtocol:
 
 
 
-    def next_seq(self, channel: int) -> int:
+    def alloc_seq(self, channel: int) -> int:
         s = self.seq_by_channel.get(channel, -1) + 1
         self.seq_by_channel[channel] = s
         return s
@@ -148,7 +147,7 @@ class GameClientProtocol:
         if self.ctrl_stream_id is None:
             self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
             
-        seq = self.next_seq(RELIABLE_CHANNEL)
+        seq = self.alloc_seq(RELIABLE_CHANNEL)
         critical_state = make_reliable_data(
             seq=seq,
             payload={"player_id": 1, "score": random.randint(0, 100)}
@@ -177,7 +176,7 @@ class GameClientProtocol:
         y = random.uniform(-10, 10)
         # Include timestamp in payload for One-Way Latency (OWL) calculation
         payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
-        seq = self.next_seq(UNRELIABLE_CHANNEL)
+        seq = self.alloc_seq(UNRELIABLE_CHANNEL)
         datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
 
         self.metrics["unreliable"]["tx"] += 1
@@ -305,19 +304,16 @@ class ClientEvents(QuicConnectionProtocol):
                     if client is not None and seq is not None:
                         item = client._inflight.pop(seq, None)
                         if item is not None:
-                            #compare rx_ts with last_ts
-                            rtt_ms = (rx_ts * 1000) - item.ts_last_ms
+                            rtt_ms = (rx_ts * 1000.0) - item.ts_last_ms
                         else:
-                            #fallback
                             rtt_ms = (rx_ts - sent_ts) * 1000.0
-
                         m = client.metrics["reliable"]
                         m["ack"] += 1
                         m["rtt"].add(rtt_ms)
                         m["jitter"].add(rtt_ms)
                         client._update_rtt(rtt_ms)
                     else:
-                        rtt_ms = (rx_ts - sent_ts) * 1000
+                        rtt_ms = (rx_ts - sent_ts) * 1000.0
                     print(f"[client] [Reliable] ACK RX: AppSeq={seq}, RTT={rtt_ms:.2f}ms")
                     return
 
