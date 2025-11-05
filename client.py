@@ -105,8 +105,6 @@ class GameClientProtocol:
            #update rtt est
             self.srtt_ms = (1-w1) * self.srtt_ms + w1 * sample_ms
 
-
-
     def _print_metrics_summary(self):
         now = time.time()
         dur = max(1e-6, now - self._start_time)
@@ -156,7 +154,15 @@ class GameClientProtocol:
 
         self.metrics["reliable"]["tx"] += 1
         self.metrics["reliable"]["bytes_tx"] += len(critical_state)
-        self._inflight[seq] = time.time()
+
+        now_ms = int(time.time() * 1000)
+        self._inflight[seq] = Inflight(
+            payload_bytes=critical_state,
+            ctrl_stream_id=self.ctrl_stream_id,
+            seq=seq,
+            ts_first_ms=now_ms,
+            ts_last_ms=now_ms,
+        )
 
         self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
         self.endpoint.transmit()
