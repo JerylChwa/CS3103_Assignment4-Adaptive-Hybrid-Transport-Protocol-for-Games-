@@ -56,7 +56,7 @@ class GameServer(QuicConnectionProtocol):
 
     def _print_metrics_summary(self):
         now = time.time()
-        print("--METRIC SUMMARY--")
+        print("\n[server] 📊 --- METRIC SUMMARY ---")
         for pkt_type in ("reliable", "unreliable"):
             m = self.metrics[pkt_type]
             dur = max(1e-6, now - self._start_time)
@@ -85,8 +85,8 @@ class GameServer(QuicConnectionProtocol):
             else:
                 print("OWL(ms): no samples")
 
-            print("Throughput ≈ {tput:.2f} kB/s}")
-            print("[server] ---\n")
+            print(f"Throughput ≈ {tput:.2f} kB/s")
+            print("[server] --------------------------\n")
 
     def connection_made(self, transport):
         super().connection_made(transport)
