@@ -100,11 +100,11 @@ class GameServer(QuicConnectionProtocol):
                         # Logging
                         print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
 
-                        metric = self.metrics["reliable"]
-                        metric["rx"] += 1
-                        metric["bytes"] += len(data_bytes)
-                        metric["owl"].add(owl_ms)
-                        metric["jitter"].add(owl_ms)
+                        m_r = self.metrics["reliable"]
+                        m_r["rx"] += 1
+                        m_r["bytes"] += len(data_bytes)
+                        m_r["owl"].add(owl_ms)
+                        m_r["jitter"].add(owl_ms)
 
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
@@ -184,6 +184,12 @@ class GameServer(QuicConnectionProtocol):
                 sent_ts = float(sent_ts_str)
                 
                 owl_ms = (rx_ts - sent_ts) * 1000
+
+                m_u = self.metrics["unreliable"]
+                m_u["rx"] += 1
+                m_u["bytes"] += len(event.data)
+                m_u["owl"].add(owl_ms)
+                m_u["jitter"].add(owl_ms)
                 
                 # Logging
                 print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, OWL={owl_ms:.2f}ms, Data={payload_str.split(',ts:')[0]}")
