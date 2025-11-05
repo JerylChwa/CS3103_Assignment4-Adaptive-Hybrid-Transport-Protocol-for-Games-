@@ -56,7 +56,7 @@ class GameServer(QuicConnectionProtocol):
 
     def _print_metrics_summary(self):
         now = time.time()
-        print("\n[server] 📊 --- METRIC SUMMARY ---")
+        print("\n[server] 📊 ---- METRIC SUMMARY ----")
         for pkt_type in ("reliable", "unreliable"):
             m = self.metrics[pkt_type]
             dur = max(1e-6, now - self._start_time)
@@ -77,15 +77,15 @@ class GameServer(QuicConnectionProtocol):
                 avg_owl = owl_stats.avg()
                 jitter_val = m["jitter"].value()
                 print(
-                    f"  OWL(ms): avg={avg_owl:.2f}, "
+                    f"    OWL(ms): avg={avg_owl:.2f}, "
                     f"p50={p.get(50, float('nan')):.2f}, "
                     f"p95={p.get(95, float('nan')):.2f}, "
                     f"jitter(RFC3550)={jitter_val:.2f}"
                 )
             else:
-                print("OWL(ms): no samples")
+                print("    OWL(ms): no samples")
 
-            print(f"Throughput ≈ {tput:.2f} kB/s")
+            print(f"    Throughput ≈ {tput:.2f} kB/s")
         print("[server] --------------------------\n")
 
     def connection_made(self, transport):
