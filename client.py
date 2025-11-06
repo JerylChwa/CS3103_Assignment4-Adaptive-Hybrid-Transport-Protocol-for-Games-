@@ -20,6 +20,7 @@ from aioquic.quic.events import (
     StreamDataReceived,
     HandshakeCompleted,
 )
+from network_emulator import NetworkEmulator
 
 @dataclass
 class Inflight:
@@ -53,11 +54,14 @@ class GameClientProtocol:
     Thin wrapper (gameNetAPI) to send data via reliable (Stream) and unreliable (Datagram) channels.
     """
 
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, emulator: Optional[NetworkEmulator] = None):
         self.endpoint = endpoint
         self.quic: QuicConnection = endpoint._quic
         self.seq_by_channel = {RELIABLE_CHANNEL: -1, UNRELIABLE_CHANNEL: -1}
         self.ctrl_stream_id: Optional[int] = None
+        
+        # Initialize emulator (if not provided, create disabled one)
+        self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
 
         self._start_time = time.time()
         self._metrics_task: Optional[asyncio.Task] = None
@@ -142,13 +146,13 @@ class GameClientProtocol:
     
     # --- Client Methods (API) ---
     # gameNetAPI : Unified Send Method
-    def send(self, data=None, reliable=True, msg_type=1):
+    async def send(self, data=None, reliable=True, msg_type=1):
         if reliable:
-            return self.send_reliable_state(data=data)
+            return await self.send_reliable_state(data=data)
         else:
-            return self.send_unreliable_movement(data=data, msg_type=msg_type)
+            return await self.send_unreliable_movement(data=data, msg_type=msg_type)
 
-    def send_reliable_state(self, data=None):
+    async def send_reliable_state(self, data=None):
         """Send a reliable, sequenced game state update.
         
         Args:
@@ -184,25 +188,30 @@ class GameClientProtocol:
         )
 
         self.quic.send_stream_data(self.ctrl_stream_id, critical_state, end_stream=False)
-        self.endpoint.transmit()
+        await self.emulator.transmit(self.endpoint.transmit, packet_info={"seq": seq, "type": "reliable"})
         print(f"[client] [Reliable] SENT: Seq={seq}, Size={len(critical_state)}, TS={time.time():.4f}")
         return seq
 
 
-    def send_unreliable_movement(self):
-        """Send an unreliable, sequenced movement update."""
+    async def send_unreliable_movement(self, data=None, msg_type=1):
+        """Send an unreliable, sequenced movement update.
+        
+        Args:
+            data: Optional payload data (currently not used, generates random position)
+            msg_type: Message type identifier for the datagram header
+        """
         x = random.uniform(-10, 10)
         y = random.uniform(-10, 10)
         # Include timestamp in payload for One-Way Latency (OWL) calculation
         payload = f"pos:{x:.2f},{y:.2f},ts:{time.time():.4f}".encode() 
         seq = self.alloc_seq(UNRELIABLE_CHANNEL)
-        datagram = make_dgram(msg_type=1, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
+        datagram = make_dgram(msg_type=msg_type, channel=UNRELIABLE_CHANNEL, seq=seq, payload=payload)
 
         self.metrics["unreliable"]["tx"] += 1
         self.metrics["unreliable"]["bytes_tx"] += len(datagram)
 
         self.quic.send_datagram_frame(datagram)
-        self.endpoint.transmit()
+        await self.emulator.transmit(self.endpoint.transmit)
         print(f"[client] [Unreliable] SENT: Seq={seq}, Size={len(datagram)}")
         return seq
 
@@ -225,7 +234,7 @@ class GameClientProtocol:
                             continue
                         #resend same exact data on same stream - retransmit
                         self.quic.send_stream_data(item.ctrl_stream_id, item.payload_bytes, end_stream=False)
-                        self.endpoint.transmit()
+                        await self.emulator.transmit(self.endpoint.transmit, packet_info={"seq": item.seq, "type": "reliable"})
                         item.retries += 1
                         item.ts_last_ms = now_ms
                         print(f"[client] Retransmit seq={seq} (try {item.retries})")
@@ -239,7 +248,7 @@ class GameClientProtocol:
             self.ctrl_stream_id = self.quic.get_next_available_stream_id(is_unidirectional=False)
             hello = json.dumps({"type": "client_hello"}).encode()
             self.quic.send_stream_data(self.ctrl_stream_id, hello, end_stream=False)
-            self.endpoint.transmit()
+            await self.emulator.transmit(self.endpoint.transmit)
 
         recv_task = asyncio.create_task(self._recv_loop())
         # Part f Randomized sending loop
@@ -255,7 +264,7 @@ class GameClientProtocol:
             self._retransmit_task.cancel()
         
         self.quic.close()
-        self.endpoint.transmit()
+        await self.emulator.transmit(self.endpoint.transmit)
 
     async def _recv_loop(self):
         """Keeps the connection alive and flushes QUIC events."""
@@ -284,13 +293,13 @@ class GameClientProtocol:
                     # Randomly decide to send reliable (e.g., 50% chance when available)
                     if random.random() < 0.5:
                         # Use unified API with reliable=True
-                        self.send(reliable=True)
+                        await self.send(reliable=True)
                         last_reliable_send = now
                 
                 # Check for unreliable send opportunity (higher rate)
                 if now - last_unreliable_send >= unreliable_period:
                     # Use unified API with reliable=False
-                    self.send(reliable=False)
+                    await self.send(reliable=False)
                     last_unreliable_send = now
                     
                 await asyncio.sleep(min(reliable_period, unreliable_period) / 2)
@@ -352,7 +361,10 @@ class ClientEvents(QuicConnectionProtocol):
                     print(f"[client] [Reliable] Data RX: {event.data!r}")
 
 
-async def main(host: str = "127.0.0.1", port: int = 4433):
+async def main(host: str = "127.0.0.1", port: int = 4433,
+               emulation_enabled: bool = False, delay_ms: float = 0,
+               jitter_ms: float = 0, packet_loss_rate: float = 0.0,
+               drop_sequences: set = None):
     cfg = QuicConfiguration(
         is_client=True,
         alpn_protocols=[ALPN],
@@ -361,10 +373,58 @@ async def main(host: str = "127.0.0.1", port: int = 4433):
     cfg.verify_mode = False
     cfg.max_datagram_frame_size = 1200
 
+    # Create network emulator
+    emulator = NetworkEmulator(
+        enabled=emulation_enabled,
+        delay_ms=delay_ms,
+        jitter_ms=jitter_ms,
+        packet_loss_rate=packet_loss_rate,
+        drop_sequences=drop_sequences or set()
+    )
+
     async with connect(host, port, configuration=cfg, create_protocol=ClientEvents) as endpoint:
-        client = GameClientProtocol(endpoint)
+        client = GameClientProtocol(endpoint, emulator=emulator)
         endpoint.metrics_client = client
         await client.run()
+        
+        # Print emulator stats if enabled
+        if emulation_enabled:
+            stats = emulator.get_stats()
+            print(f"\n[client] 📊 Network Emulator Stats:")
+            print(f"  Total packets: {stats['total_packets']}")
+            print(f"  Dropped packets: {stats['dropped_packets']}")
+            print(f"  Drop rate: {stats['drop_rate']:.2%}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Example configurations (uncomment one):
+    
+    # 1. No emulation (normal operation)
+    # asyncio.run(main())
+    
+    # 2. Test retransmission with selective drops
+    # asyncio.run(main(
+    #     emulation_enabled=True,
+    #     delay_ms=0,
+    #     jitter_ms=0,
+    #     packet_loss_rate=0.0,
+    #     drop_sequences={3, 7, 12}  # Drop specific packets to test retransmission
+    # ))
+    
+    # 3. Test reordering with jitter (no drops)
+    asyncio.run(main(
+        emulation_enabled=True,
+        delay_ms=0,
+        jitter_ms=0,
+        packet_loss_rate=0.0,      # No random loss - ACKs won't be dropped
+        drop_sequences={3, 7, 12}   # Drop these specific packets to test retransmission
+    ))
+
+    
+    # 4. Test combined: retransmission + reordering
+    # asyncio.run(main(
+    #     emulation_enabled=True,
+    #     delay_ms=10,
+    #     jitter_ms=30,
+    #     packet_loss_rate=0.0,
+    #     drop_sequences={5, 15}
+    # ))

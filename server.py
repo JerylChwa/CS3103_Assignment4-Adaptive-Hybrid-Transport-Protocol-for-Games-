@@ -19,6 +19,7 @@ from aioquic.quic.events import (
     StreamDataReceived,
     HandshakeCompleted,
 )
+from network_emulator import NetworkEmulator
 
 ALPN = "game/1"
 RELIABLE_TIMEOUT_MS = 200  # T milliseconds threshold
@@ -31,7 +32,7 @@ def make_server_cfg() -> QuicConfiguration:
     return cfg
 
 class GameServer(QuicConnectionProtocol):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, emulator: Optional[NetworkEmulator] = None, **kwargs):
         super().__init__(*args, **kwargs)
         # Application-layer buffer for reliable packets {app_seq: (timestamp_rx, data_bytes)}
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
@@ -41,6 +42,10 @@ class GameServer(QuicConnectionProtocol):
 
         self._start_time = time.time()
         self.metrics_task: Optional[asyncio.Task] = None
+        
+        # Initialize emulator (if not provided, create disabled one)
+        self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
+        
         #set up metric storage
         self.metrics = {
             "reliable": {
@@ -55,6 +60,18 @@ class GameServer(QuicConnectionProtocol):
             }
         }
 
+    def _safe_transmit(self):
+        """
+        Helper to safely call emulator.transmit() in both sync and async contexts.
+        Since quic_event_received is synchronous, we schedule the async transmit as a task.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.emulator.transmit(self.transmit))
+        except RuntimeError:
+            # No running loop, just call transmit directly (fallback)
+            self.transmit()
+    
     def _had_activity_since_last(self):
         r = self.metrics["reliable"];
         u = self.metrics["unreliable"]
@@ -129,7 +146,7 @@ class GameServer(QuicConnectionProtocol):
                         }
                         sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
                         self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
-                        self.transmit()
+                        await self.emulator.transmit(self.transmit)
                     except Exception as e:
                         print(f"[server] Warning: failed to send metrics heartbeat: {e}")
         except asyncio.CancelledError:
@@ -198,7 +215,7 @@ class GameServer(QuicConnectionProtocol):
                                 b"ack:" + data_bytes,
                                 end_stream=False
                             )
-                            self.transmit()
+                            await self.emulator.transmit(self.transmit)
                         #END OF RETRANSMISSION TEST
                         """
 
@@ -206,7 +223,7 @@ class GameServer(QuicConnectionProtocol):
 
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
-                        self.transmit()
+                        await self.emulator.transmit(self.transmit)
 
 
                     except Exception as e:
@@ -227,7 +244,7 @@ class GameServer(QuicConnectionProtocol):
             # Send initial reliable hello on a fresh bidirectional stream
             stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
             self._quic.send_stream_data(stream_id, json.dumps({"type": "server_hello"}).encode(), end_stream=False)
-            self.transmit()
+            self._safe_transmit()
 
         elif isinstance(event, StreamDataReceived):
             # buffer here
@@ -296,13 +313,43 @@ class GameServer(QuicConnectionProtocol):
                 print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, Data={payload!r}")
 
 
-async def main(host="0.0.0.0", port=4433):
+async def main(host="0.0.0.0", port=4433,
+               emulation_enabled: bool = False, delay_ms: float = 0,
+               jitter_ms: float = 0, packet_loss_rate: float = 0.0,
+               drop_sequences: set = None):
     cfg = make_server_cfg()
-    await serve(host, port, configuration=cfg, create_protocol=GameServer)
+    
+    # Create network emulator
+    emulator = NetworkEmulator(
+        enabled=emulation_enabled,
+        delay_ms=delay_ms,
+        jitter_ms=jitter_ms,
+        packet_loss_rate=packet_loss_rate,
+        drop_sequences=drop_sequences or set()
+    )
+    
+    # Create protocol factory that passes emulator to each connection
+    def create_protocol(*args, **kwargs):
+        return GameServer(*args, emulator=emulator, **kwargs)
+    
+    await serve(host, port, configuration=cfg, create_protocol=create_protocol)
     print(f"[server] QUIC listening on {host}:{port} (ALPN={ALPN})")
     print(f"[server] Reliable data skip threshold (T): {RELIABLE_TIMEOUT_MS} ms.")
+    if emulation_enabled:
+        print(f"[server] Network emulation: delay={delay_ms}ms, jitter={jitter_ms}ms, loss={packet_loss_rate:.2%}")
     # ⛔️ Keep the server running forever
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
+    # Example configurations (uncomment one):
+    
+    # 1. No emulation (normal operation)
     asyncio.run(main())
+    
+    # 2. Server-side emulation (affects ACKs back to client)
+    # asyncio.run(main(
+    #     emulation_enabled=True,
+    #     delay_ms=5,
+    #     jitter_ms=10,
+    #     packet_loss_rate=0.0
+    # ))
