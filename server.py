@@ -19,6 +19,13 @@ from aioquic.quic.events import (
     StreamDataReceived,
     HandshakeCompleted,
 )
+from network_emulator import NetworkEmulator
+
+def get_timestamp():
+    """Return formatted timestamp for logging: HH:MM:SS.mmm"""
+    now = time.time()
+    ms = int((now * 1000) % 1000)
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{ms:03d}"
 
 ALPN = "game/1"
 RELIABLE_TIMEOUT_MS = 200  # T milliseconds threshold
@@ -31,16 +38,35 @@ def make_server_cfg() -> QuicConfiguration:
     return cfg
 
 class GameServer(QuicConnectionProtocol):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, emulator: Optional[NetworkEmulator] = None, **kwargs):
         super().__init__(*args, **kwargs)
         # Application-layer buffer for reliable packets {app_seq: (timestamp_rx, data_bytes)}
         self.reliable_buffer: Dict[int, Tuple[float, bytes]] = {}
         self.next_expected_seq = 0
+        # Track when we started waiting for each missing sequence {seq: wait_start_ts}
+        self.missing_seq_wait_start: Dict[int, float] = {}
         self.flush_task: Optional[asyncio.Task] = None
         self._last_counters = {"rel_rx": 0, "unrel_rx": 0, "bytes": 0}
+        
+        # Network emulator (defaults to disabled if not provided)
+        self.emulator = emulator if emulator is not None else NetworkEmulator(enabled=False)
 
         self._start_time = time.time()
         self.metrics_task: Optional[asyncio.Task] = None
+    
+    def _safe_transmit(self):
+        """Safely handle async transmit in both sync and async contexts."""
+        if not self.emulator.enabled:
+            # If emulation disabled, just call transmit directly
+            self.transmit()
+        else:
+            # If emulation enabled, create async task if loop is running
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.emulator.transmit(self.transmit))
+            except RuntimeError:
+                # No running loop, just call transmit directly (fallback)
+                self.transmit()
         #set up metric storage
         self.metrics = {
             "reliable": {
@@ -129,9 +155,9 @@ class GameServer(QuicConnectionProtocol):
                         }
                         sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
                         self._quic.send_stream_data(sid, json.dumps(stats).encode(), end_stream=False)
-                        self.transmit()
+                        await self.emulator.transmit(self.transmit)
                     except Exception as e:
-                        print(f"[server] Warning: failed to send metrics heartbeat: {e}")
+                        print(f"[{get_timestamp()}] [server] Warning: failed to send metrics heartbeat: {e}")
         except asyncio.CancelledError:
             pass
 
@@ -143,22 +169,63 @@ class GameServer(QuicConnectionProtocol):
                 now = time.time()
                 skipped_this_cycle = False
                 
+                # Part E : Retransmission based on timer, and if any packet is lost and retransmision not reached by RELIABLE_TIMEOUT_MS, skip and display the rest
                 if self.next_expected_seq not in self.reliable_buffer:
-                    next_available_seq = self.next_expected_seq + 1
+                    # Track when we started waiting for this missing sequence
+                    if self.next_expected_seq not in self.missing_seq_wait_start:
+                        self.missing_seq_wait_start[self.next_expected_seq] = now
                     
-                    if next_available_seq in self.reliable_buffer:
-                         (rx_ts, _) = self.reliable_buffer[next_available_seq]
-                         time_waiting = (now - rx_ts) * 1000
-
-                         if time_waiting > RELIABLE_TIMEOUT_MS:
+                    # Check if we've been waiting for this sequence for > RELIABLE_TIMEOUT_MS
+                    wait_start_ts = self.missing_seq_wait_start[self.next_expected_seq]
+                    time_waiting_for_missing = (now - wait_start_ts) * 1000
+                    
+                    # Find the smallest sequence number in buffer that's greater than next_expected_seq
+                    later_sequences = [seq for seq in self.reliable_buffer.keys() if seq > self.next_expected_seq]
+                    
+                    if later_sequences:
+                        # Get the smallest later sequence (first out-of-order packet received)
+                        next_available_seq = min(later_sequences)
+                        (rx_ts, _) = self.reliable_buffer[next_available_seq]
+                        time_waiting_for_later = (now - rx_ts) * 1000
+                        
+                        # Only skip if:
+                        # 1. We've been waiting for the missing packet for > RELIABLE_TIMEOUT_MS
+                        # 2. The later packet has also been waiting long enough (to ensure it's actually out-of-order)
+                        # 3. The later packet arrived AFTER we started waiting for the missing packet
+                        #    (This prevents skipping a packet that just became expected - give it a full timeout period)
+                        #    If the later packet arrived before we started waiting, it means we just skipped the previous packet
+                        #    and should give the new expected packet a chance to arrive
+                        later_packet_arrived_after_wait_start = rx_ts >= wait_start_ts
+                        
+                        if time_waiting_for_missing > RELIABLE_TIMEOUT_MS and time_waiting_for_later > RELIABLE_TIMEOUT_MS and later_packet_arrived_after_wait_start:
+                            skipped_seq = self.next_expected_seq
                             self.metrics["reliable"]["stale"] += 1
-                            print(f"[server] ⚠️ RELIABLE SKIP: Seq={self.next_expected_seq} skipped. Next Seq={next_available_seq} waited for {time_waiting:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
+                            print(f"[{get_timestamp()}] [server] ⚠️ RELIABLE SKIP: Seq={skipped_seq} skipped. Waited {time_waiting_for_missing:.2f}ms, Next Seq={next_available_seq} waited {time_waiting_for_later:.2f}ms > {RELIABLE_TIMEOUT_MS}ms.")
+                            
+                            # Send skip notification to client so it can stop retransmitting
+                            skip_notification = json.dumps({
+                                "type": "skip",
+                                "seq": skipped_seq,
+                                "next_seq": next_available_seq
+                            }).encode()
+                            skip_stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                            self._quic.send_stream_data(skip_stream_id, skip_notification, end_stream=False)
+                            await self.emulator.transmit(self.transmit)  # Use await to ensure it's sent
+                            
+                            # Clean up tracking and skip the missing packet
+                            self.missing_seq_wait_start.pop(self.next_expected_seq, None)
                             self.next_expected_seq += 1
                             skipped_this_cycle = True
+                            
+                            # When we skip a packet, the next packet becomes expected
+                            # Don't start tracking its wait time immediately - give it a chance to arrive
+                            # The next iteration will start tracking if it's still missing
                             continue
 
-                
+                # Part C : Reorder if not in order (and D)
                 while self.next_expected_seq in self.reliable_buffer:
+                    # Packet arrived, remove from missing tracking
+                    self.missing_seq_wait_start.pop(self.next_expected_seq, None)
                     rx_ts, data_bytes = self.reliable_buffer.pop(self.next_expected_seq)
                     try:
                         
@@ -169,7 +236,7 @@ class GameServer(QuicConnectionProtocol):
                         owl_ms = (rx_ts - sent_ts) * 1000
                         
                         # Logging
-                        print(f"[server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
+                        print(f"[{get_timestamp()}] [server] ✅ RELIABLE RX: Seq={self.next_expected_seq}, OWL={owl_ms:.2f}ms, Data={packet.get('data')}")
 
                         m_r = self.metrics["reliable"]
                         m_r["rx"] += 1
@@ -179,27 +246,27 @@ class GameServer(QuicConnectionProtocol):
 
                         # Echo ACK for RTT calculation on client side
                         self._quic.send_stream_data(self._quic.get_next_available_stream_id(is_unidirectional=False), b"ack:" + data_bytes, end_stream=False)
-                        self.transmit()
+                        await self.emulator.transmit(self.transmit)
 
                     except Exception as e:
-                        print(f"[server] Error processing reliable packet: {e}")
+                        print(f"[{get_timestamp()}] [server] Error processing reliable packet: {e}")
                     
                     self.next_expected_seq += 1
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            print(f"[server] Flush task error: {e}")
+            print(f"[{get_timestamp()}] [server] Flush task error: {e}")
 
 
     def quic_event_received(self, event) -> None:
         if isinstance(event, HandshakeCompleted):
             peer = self._quic._peer_address if hasattr(self._quic, "_peer_address") else "<peer>"
-            print(f"[server] Handshake completed with {peer}")
+            print(f"[{get_timestamp()}] [server] Handshake completed with {peer}")
             # Send initial reliable hello on a fresh bidirectional stream
             stream_id = self._quic.get_next_available_stream_id(is_unidirectional=False)
             self._quic.send_stream_data(stream_id, json.dumps({"type": "server_hello"}).encode(), end_stream=False)
-            self.transmit()
+            self._safe_transmit()
 
         elif isinstance(event, StreamDataReceived):
             # buffer here
@@ -209,7 +276,7 @@ class GameServer(QuicConnectionProtocol):
             try:
                 data_str = event.data.decode()
                 if data_str.startswith('{"type": "client_hello"}'):
-                    print(f"[server] [Reliable] Initial client_hello received.")
+                    print(f"[{get_timestamp()}] [server] [Reliable] Initial client_hello received.")
                     return
 
                 packet = json.loads(data_str)
@@ -217,27 +284,33 @@ class GameServer(QuicConnectionProtocol):
                 pkt_ts = packet.get("ts")
                 
                 if app_seq is None or pkt_ts is None:
-                    print(f"[server] [Reliable]  RC: missing seq/ts: {packet}.")
+                    print(f"[{get_timestamp()}] [server] [Reliable] RC: missing seq/ts: {packet}.")
                     return
 
                 if app_seq < self.next_expected_seq:
                     self.metrics[r_str]["dup"] = self.metrics[r_str].get("dup", 0) + 1
-                    print(f"[server] 🔄 [Reliable] RX: Seq={app_seq}, current expected={self.next_expected_seq}")
+                    print(f"[{get_timestamp()}] [server] 🔄 [Reliable] RX: Seq={app_seq}, current expected={self.next_expected_seq}")
                     return
 
-                # part e buffer
-                self.reliable_buffer[app_seq] = (rx_ts, event.data)
+                # part e buffer - only store if not already buffered (preserve original arrival time)
+                if app_seq not in self.reliable_buffer:
+                    # First time receiving this sequence - store with current timestamp
+                    self.reliable_buffer[app_seq] = (rx_ts, event.data)
+                else:
+                    # Duplicate retransmission - keep original timestamp, don't overwrite
+                    self.metrics[r_str]["dup"] = self.metrics[r_str].get("dup", 0) + 1
+                    # Don't update the buffer entry - keep the original arrival time
 
                 if app_seq > self.next_expected_seq:
                     # part g: Packet arrived out-of-order
                     self.metrics[r_str]["ooo"] += 1
-                    print(f"[server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
+                    print(f"[{get_timestamp()}] [server] ⏳ [Reliable] RX: Seq={app_seq} (O.O.O), Expected={self.next_expected_seq}. Buffering...")
 
                 else:
-                    print(f"[server] [Reliable] RX: Unsequenced data: {event.data!r}")
+                    print(f"[{get_timestamp()}] [server] [Reliable] RX: Unsequenced data: {event.data!r}")
             
             except json.JSONDecodeError:
-                print(f"[server] [Reliable] RX: Non-JSON data on stream {event.stream_id}")
+                print(f"[{get_timestamp()}] [server] [Reliable] RX: Non-JSON data on stream {event.stream_id}")
 
 
         elif isinstance(event, DatagramFrameReceived):
@@ -263,18 +336,56 @@ class GameServer(QuicConnectionProtocol):
                 m_u["jitter"].add(owl_ms)
                 
                 # Logging
-                print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, OWL={owl_ms:.2f}ms, Data={payload_str.split(',ts:')[0]}")
+                print(f"[{get_timestamp()}] [server] ⏩ [Unreliable] RX: Seq={seq}, OWL={owl_ms:.2f}ms, Data={payload_str.split(',ts:')[0]}")
             except Exception:
-                print(f"[server] ⏩ [Unreliable] RX: Seq={seq}, Data={payload!r}")
+                print(f"[{get_timestamp()}] [server] ⏩ [Unreliable] RX: Seq={seq}, Data={payload!r}")
 
 
-async def main(host="0.0.0.0", port=4433):
+async def main(host="0.0.0.0", port=4433,
+               emulation_enabled: bool = False, delay_ms: float = 0,
+               jitter_ms: float = 0, packet_loss_rate: float = 0.0,
+               drop_sequences: Optional[set] = None):
+    """
+    Main server function.
+    
+    Args:
+        host: Server hostname
+        port: Server port
+        emulation_enabled: Enable network emulation
+        delay_ms: Base delay in milliseconds
+        jitter_ms: Jitter variation in milliseconds
+        packet_loss_rate: Packet loss rate (0.0 to 1.0)
+        drop_sequences: Set of sequence numbers to selectively drop (not used on server side)
+    """
     cfg = make_server_cfg()
-    await serve(host, port, configuration=cfg, create_protocol=GameServer)
-    print(f"[server] QUIC listening on {host}:{port} (ALPN={ALPN})")
-    print(f"[server] Reliable data skip threshold (T): {RELIABLE_TIMEOUT_MS} ms.")
+    
+    # Create network emulator
+    emulator = NetworkEmulator(
+        enabled=emulation_enabled,
+        delay_ms=delay_ms,
+        jitter_ms=jitter_ms,
+        packet_loss_rate=packet_loss_rate,
+        drop_sequences=drop_sequences or set()
+    )
+    
+    # Create protocol factory that passes emulator to each connection
+    def create_protocol(*args, **kwargs):
+        return GameServer(*args, emulator=emulator, **kwargs)
+    
+    await serve(host, port, configuration=cfg, create_protocol=create_protocol)
+    print(f"[{get_timestamp()}] [server] QUIC listening on {host}:{port} (ALPN={ALPN})")
+    print(f"[{get_timestamp()}] [server] Reliable data skip threshold (T): {RELIABLE_TIMEOUT_MS} ms.")
+    if emulation_enabled:
+        print(f"[{get_timestamp()}] [server] Network emulation: delay={delay_ms}ms, jitter={jitter_ms}ms, loss={packet_loss_rate:.2%}")
     # ⛔️ Keep the server running forever
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Test retransmission: no random loss, ACKs will get through
+    asyncio.run(main(
+        emulation_enabled=True,
+        delay_ms=0,
+        jitter_ms=0,
+        packet_loss_rate=0.0,     # No random loss - ACKs won't be dropped
+        drop_sequences=set()      # Not used on server side
+    ))
