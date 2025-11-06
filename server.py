@@ -283,9 +283,15 @@ class GameServer(QuicConnectionProtocol):
                     print(f"[server] [Reliable]  RC: missing seq/ts: {packet}.")
                     return
 
-                if app_seq < self.next_expected_seq:
-                    self.metrics[r_str]["dup"] = self.metrics[r_str].get("dup", 0) + 1
-                    print(f"[server] 🔄 [Reliable] RX: Seq={app_seq}, current expected={self.next_expected_seq}")
+                if app_seq < self.next_expected_seq or app_seq in self.reliable_buffer:
+                    self.metrics[r_str]["dup"] += 1
+                   #RE-Ack t0 clear clients inflight if previous ack was lost
+                    try:
+                        sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                        self._quic.send_stream_data(sid, b"ack:" + event.data, end_stream=False)
+                        self._safe_transmit()
+                    except Exception as e:
+                        print(f"[{get_timestamp()}] [server] re-ACK failed for dup see {app_seq}: {e}")
                     return
 
                 # part e buffer

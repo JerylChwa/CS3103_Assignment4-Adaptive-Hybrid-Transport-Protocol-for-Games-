@@ -16,7 +16,6 @@ from aioquic.asyncio import connect, QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import (
-    DatagramFrameReceived,
     StreamDataReceived,
     HandshakeCompleted,
 )
