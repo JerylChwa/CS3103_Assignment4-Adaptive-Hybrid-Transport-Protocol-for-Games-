@@ -168,6 +168,7 @@ class GameServer(QuicConnectionProtocol):
                     try:
                         stats = {
                             "type": "server_metrics",
+                            "ts": time.time(),
                             "unrel_rx": self.metrics["unreliable"]["rx"],
                             "rel_rx": self.metrics["reliable"]["rx"],
                         }
