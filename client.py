@@ -526,15 +526,17 @@ if __name__ == "__main__":
     # ))
 
 
+    """
     #demo test configs
-    ## 1) baseline
+    ## 1) baseline - TEST_DISTURB_ACKS = False
     print(f"=========== DEMO TEST 1 - BASELINE ===========")
     asyncio.run(main(
         emulation_enabled=False,
     ))
 
-    """
-        ## 2) retransmissions
+
+
+        ## 2) retransmissions - TEST_DISTURB_ACKS = True
     asyncio.run(main(
     emulation_enabled=True,
         packet_loss_rate=0.0,
@@ -543,25 +545,27 @@ if __name__ == "__main__":
         drop_sequences={3,7,12},
     ))
 
-        ## 3) reordering
-    asyncio.run(main(
-        emulation_enabled=True,
-        packet_loss_rate=0.0,
-        drop_sequences=set(),
-        delay_ms=0,
-        jitter_ms=80,
-    ))
+    ## 3) reordering - TEST_DISTURB_ACKS = False
+    ## RELIABLE_TIMEOUT_MS = 1000
+asyncio.run(main(
+    emulation_enabled=True,
+    packet_loss_rate=0.0,
+    drop_sequences=set(),
+    delay_ms=0,
+    jitter_ms=80,
+))
 
-        ## 4 a)) low loss
+    ## 4 a)) low loss - TEST_DISTURB_ACKS = False
     asyncio.run(main(
         emulation_enabled=True,
         packet_loss_rate=0.01,
         delay_ms=5,
         jitter_ms=5,
         drop_sequences=set(),
-     ))
+    ))
 
-        # 4 b)) high loss
+    """
+# 4 b)) high loss - TEST_DISTURB_ACKS = False
     asyncio.run(main(
         emulation_enabled=True,
         packet_loss_rate=0.15,
@@ -569,4 +573,3 @@ if __name__ == "__main__":
         jitter_ms=20,
         drop_sequences=set(),
     ))
-    """
