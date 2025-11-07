@@ -6,6 +6,8 @@ from typing import Optional, Dict
 from metrics import RollingStats, Jitter
 from dataclasses import dataclass
 
+from server import RELIABLE_TIMEOUT_MS
+
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -502,6 +504,7 @@ if __name__ == "__main__":
     #     drop_sequences={3, 7, 12}  # Drop specific packets to test retransmission
     # ))
 
+    """
     # 3. Test reordering with jitter (no drops)
     asyncio.run(main(
         emulation_enabled=True,
@@ -510,6 +513,7 @@ if __name__ == "__main__":
         packet_loss_rate=0.0,      # No random loss - ACKs won't be dropped
         drop_sequences={3, 7, 12}   # Drop these specific packets to test retransmission
     ))
+    """
 
 
     # 4. Test combined: retransmission + reordering
@@ -520,3 +524,49 @@ if __name__ == "__main__":
     #     packet_loss_rate=0.0,
     #     drop_sequences={5, 15}
     # ))
+
+
+    #demo test configs
+    ## 1) baseline
+    print(f"=========== DEMO TEST 1 - BASELINE ===========")
+    asyncio.run(main(
+        emulation_enabled=False,
+    ))
+
+    """
+        ## 2) retransmissions
+    asyncio.run(main(
+    emulation_enabled=True,
+        packet_loss_rate=0.0,
+        jitter_ms=0,
+        delay_ms=0,
+        drop_sequences={3,7,12},
+    ))
+
+        ## 3) reordering
+    asyncio.run(main(
+        emulation_enabled=True,
+        packet_loss_rate=0.0,
+        drop_sequences=set(),
+        delay_ms=0,
+        jitter_ms=80,
+    ))
+
+        ## 4 a)) low loss
+    asyncio.run(main(
+        emulation_enabled=True,
+        packet_loss_rate=0.01,
+        delay_ms=5,
+        jitter_ms=5,
+        drop_sequences=set(),
+     ))
+
+        # 4 b)) high loss
+    asyncio.run(main(
+        emulation_enabled=True,
+        packet_loss_rate=0.15,
+        delay_ms=10,
+        jitter_ms=20,
+        drop_sequences=set(),
+    ))
+    """
