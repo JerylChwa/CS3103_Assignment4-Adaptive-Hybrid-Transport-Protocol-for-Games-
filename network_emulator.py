@@ -23,7 +23,8 @@ class NetworkEmulator:
     """
     
     def __init__(self, enabled: bool = False, delay_ms: float = 0, jitter_ms: float = 0, 
-                 packet_loss_rate: float = 0.0, drop_sequences: Optional[Set[int]] = None):
+                 packet_loss_rate: float = 0.0, drop_sequences: Optional[Set[int]] = None,
+                 drop_once: bool = True):
         """
         Initialize network emulator.
         
@@ -38,9 +39,11 @@ class NetworkEmulator:
         self.delay_ms = delay_ms
         self.jitter_ms = jitter_ms
         self.packet_loss_rate = packet_loss_rate
-        self.drop_sequences = drop_sequences or set()  # Sequence numbers to selectively drop
+        self.drop_sequences = drop_sequences or set()
         self._dropped_count = 0
         self._total_count = 0
+        self.drop_once = drop_once
+        self._already_dropped: Set[int] = set()
     
     async def transmit(self, original_transmit_func: Callable, packet_info: Optional[dict] = None):
         """
@@ -61,10 +64,12 @@ class NetworkEmulator:
         if packet_info and packet_info.get("type") == "reliable":
             seq = packet_info.get("seq")
             if seq is not None and seq in self.drop_sequences:
-                self._dropped_count += 1
-                print(f"[emulator] 🎯 SELECTIVE DROP: Seq={seq} (configured drop list), "
-                      f"total dropped: {self._dropped_count}/{self._total_count}")
-                return  # Don't call transmit() - packet is lost
+                #print(f"[emulator]  🎯 DROP: Seq={seq}")
+                if (self.drop_once and seq not in self._already_dropped) or (not self.drop_once):
+                    print(f"[emulator] ALREADY DROPPED: Seq={seq} ({self._already_dropped} times)")
+                    self._dropped_count += 1
+                    self._already_dropped.add(seq)  # future retries go through
+                    return
         
         # Check for random packet loss (only if not using selective dropping, or for non-reliable packets)
         if self.packet_loss_rate > 0:
