@@ -92,6 +92,16 @@ class GameServer(QuicConnectionProtocol):
         self._last_counters = cur
         return changed
 
+    def _reset_metrics(self):
+        self._start_time = time.time()
+        self._last_counters = {"rel_rx": 0, "unrel_rx": 0, "bytes": 0}
+        self.metrics = {
+            "reliable": {"owl": RollingStats(), "jitter": Jitter(),
+                         "rx": 0, "stale": 0, "ooo": 0, "dup": 0, "bytes": 0},
+            "unreliable": {"owl": RollingStats(), "jitter": Jitter(),
+                           "rx": 0, "bytes": 0}
+        }
+
     def _print_metrics_summary(self):
         now = time.time()
         print("\n[server] 📊 ---- METRIC SUMMARY ----")
@@ -250,6 +260,14 @@ class GameServer(QuicConnectionProtocol):
                     print(f"[server] [Reliable] Initial client_hello received.")
                     return
 
+                #metric helper
+                if data_str.startswith('{"type": "metrics_reset"}'):
+                    self._reset_metrics()
+                    sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                    self._quic.send_stream_data(sid, b'{"type":"metrics_reset_ack"}', end_stream=False)
+                    self._safe_transmit()
+                    return
+
                 packet = json.loads(data_str)
                 app_seq = packet.get("seq")
                 pkt_ts = packet.get("ts")
@@ -373,7 +391,7 @@ if __name__ == "__main__":
     #     packet_loss_rate=0.0
     # ))
 
-    #DEMO TEST 4)
+    #DEMO TEST 4B)
     asyncio.run(main(
         emulation_enabled=True,
         delay_ms=10,
